@@ -1,0 +1,28 @@
+# Excel / 원본 데이터 (용량 크고 내부 문서)
+*.xlsx
+*.xls
+*.xlsm
+*.dbc
+*.docx
+
+# ARXML 원본 (대용량 프로젝트 파일)
+SBW_FMEA/
+input/
+output/
+guide_images/
+
+# 임시 파일
+~$*
+*.tmp
+__pycache__/
+*.pyc
+.env
+.env.local
+
+# fmea-web은 별도 GitHub repo (https://github.com/wjh5886/fmea-automation)
+fmea-web/
+
+# Claude 내부 파일
+.claude/
+.mcp.json
+*.exe
