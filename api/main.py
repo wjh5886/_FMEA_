@@ -1,9 +1,24 @@
 """FMEA Pipeline API — Railway 배포용 FastAPI 앱"""
 
-import uuid
+import uuid, sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from pipeline import run_pipeline
+
+# RAG 검색기 (지연 초기화)
+_searcher = None
+def get_searcher():
+    global _searcher
+    if _searcher is None:
+        try:
+            from rag_search import RagSearcher
+            _searcher = RagSearcher()
+        except Exception:
+            pass
+    return _searcher
 
 app = FastAPI(title="FMEA Pipeline API")
 
@@ -43,9 +58,30 @@ async def create_job(
     return {"job_id": job_id}
 
 
+@app.get("/jobs")
+def list_jobs():
+    return [{"job_id": k, **v} for k, v in jobs.items()]
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+class SimilarRequest(BaseModel):
+    variable_name: str
+    failure_mode: str | None = None
+    top_k: int = 5
+
+
+@app.post("/rag/similar")
+def find_similar(req: SimilarRequest):
+    """유사 FMEA 항목 검색 (RAG)"""
+    searcher = get_searcher()
+    if searcher is None:
+        raise HTTPException(status_code=503, detail="RAG 모델 미초기화 (rag_embed.py 먼저 실행)")
+    results = searcher.search(req.variable_name, req.failure_mode, top_k=req.top_k)
+    return {"results": results}

@@ -25,7 +25,7 @@ SB_H = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
 NS = "http://autosar.org/schema/r4.0"
 NP = {"ar": NS}
 
-MODES_SR = ["MORE", "LESS", "CORRUPT", "EARLY", "LATE", "STUCK", "ERRATIC"]
+MODES_SR = ["MORE", "LESS", "CORRUPT", "EARLY", "LATE"]
 MODES_CS = ["CORRUPT", "EARLY", "LATE"]
 
 DETAIL_TMPL = {
@@ -34,8 +34,6 @@ DETAIL_TMPL = {
     "CORRUPT": "{var}이(가) 논리적으로 잘못된 값을 출력/수신",
     "EARLY":   "{var}이(가) 예상 시점보다 일찍 업데이트/발생됨",
     "LATE":    "{var}이(가) 예상 시점보다 늦게 업데이트됨",
-    "STUCK":   "{var}이(가) 특정 값에 고착되어 변화하지 않음",
-    "ERRATIC": "{var}이(가) 불규칙하게 값이 변동함",
 }
 
 CAN_RX_COMPONENTS = {"CtAp_RxMainCAN", "CtAp_RxSubCAN"}
@@ -439,16 +437,14 @@ _DET_BASE = {
     "MORE":    3,   # 범위 초과 → 범위 체크로 검출 쉬움
     "LESS":    3,
     "CORRUPT": 5,   # 논리 오류 → 패리티/CRC 필요
-    "STUCK":   4,   # 고착 → 모니터링으로 검출 가능
     "EARLY":   6,   # 타이밍 → 검출 어려움
     "LATE":    6,
-    "ERRATIC": 7,   # 간헐적 → 가장 검출 어려움
 }
 
 # failure_mode → Occurrence 기본값
 _OCC_BASE = {
     "MORE": 3, "LESS": 3, "CORRUPT": 3,
-    "STUCK": 3, "EARLY": 2, "LATE": 3, "ERRATIC": 2,
+    "EARLY": 2, "LATE": 3,
 }
 
 def rule_based_sod(variable_name: str, failure_mode: str, category: str) -> dict:
