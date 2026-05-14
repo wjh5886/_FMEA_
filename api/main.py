@@ -1,11 +1,15 @@
 """FMEA Pipeline API — Railway 배포용 FastAPI 앱"""
 
-import uuid, os, requests as _req
+import uuid, os, requests as _req, logging
 
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pipeline import run_pipeline
+
+logger = logging.getLogger("fmea")
 
 SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
 SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
@@ -20,6 +24,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    logger.warning("422 from %s %s | body: %s | errors: %s",
+                   request.method, request.url.path, body.decode()[:200], exc.errors())
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 # 메모리 내 잡 저장소 (재시작 시 초기화됨 — 장기 운영 시 Redis/DB 권장)
 jobs: dict = {}
