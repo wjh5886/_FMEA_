@@ -1,24 +1,16 @@
 """FMEA Pipeline API — Railway 배포용 FastAPI 앱"""
 
-import uuid, sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import uuid, os, requests as _req
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pipeline import run_pipeline
 
-# RAG 검색기 (지연 초기화)
-_searcher = None
-def get_searcher():
-    global _searcher
-    if _searcher is None:
-        try:
-            from rag_search import RagSearcher
-            _searcher = RagSearcher()
-        except Exception:
-            pass
-    return _searcher
+SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
+SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
+SB_H = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
+SRC_PROJECT_IDS = ["0715f883-d3a1-4ddd-8a3b-d3071da9ed3e"]  # JG1
 
 app = FastAPI(title="FMEA Pipeline API")
 
@@ -72,16 +64,50 @@ def get_job(job_id: str):
 
 
 class SimilarRequest(BaseModel):
-    variable_name: str
+    item_id: str
     failure_mode: str | None = None
     top_k: int = 5
 
 
 @app.post("/rag/similar")
 def find_similar(req: SimilarRequest):
-    """유사 FMEA 항목 검색 (RAG)"""
-    searcher = get_searcher()
-    if searcher is None:
-        raise HTTPException(status_code=503, detail="RAG 모델 미초기화 (rag_embed.py 먼저 실행)")
-    results = searcher.search(req.variable_name, req.failure_mode, top_k=req.top_k)
+    """유사 FMEA 항목 검색 — 항목의 저장된 임베딩을 쿼리로 사용 (모델 불필요)"""
+    # 1. 해당 항목의 임베딩 조회
+    r = _req.get(
+        f"{SB_URL}/rest/v1/fmea_items",
+        headers=SB_H,
+        params={"id": f"eq.{req.item_id}", "select": "embedding"},
+        verify=False,
+    )
+    rows = r.json()
+    if not rows or not rows[0].get("embedding"):
+        raise HTTPException(status_code=404, detail="임베딩 없음 — rag_embed.py 실행 필요")
+
+    embedding = rows[0]["embedding"]
+
+    # 2. 유사 항목 검색
+    payload = {
+        "query_embedding": embedding,
+        "match_count": req.top_k,
+        "source_project_ids": SRC_PROJECT_IDS,
+        "filter_failure_mode": req.failure_mode,
+    }
+    r2 = _req.post(
+        f"{SB_URL}/rest/v1/rpc/match_fmea_items",
+        headers=SB_H,
+        json=payload,
+        verify=False,
+    )
+    if r2.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Supabase 오류: {r2.text[:200]}")
+
+    results = r2.json()
+
+    # failure_mode 일치 결과 없으면 ANY로 재검색
+    if not results and req.failure_mode:
+        payload["filter_failure_mode"] = None
+        r3 = _req.post(f"{SB_URL}/rest/v1/rpc/match_fmea_items", headers=SB_H, json=payload, verify=False)
+        if r3.status_code == 200:
+            results = r3.json()
+
     return {"results": results}
