@@ -1050,18 +1050,9 @@ def parse_spec_document(file_data: bytes, filename: str) -> str:
     ext = filename.lower().rsplit(".", 1)[-1]
 
     if ext == "pdf":
-        try:
-            import pdfplumber, io
-            with pdfplumber.open(io.BytesIO(file_data)) as pdf:
-                return "\n".join(p.extract_text() or "" for p in pdf.pages)
-        except ImportError:
-            pass
-        try:
-            import pypdf, io
-            reader = pypdf.PdfReader(io.BytesIO(file_data))
-            return "\n".join(pg.extract_text() or "" for pg in reader.pages)
-        except ImportError:
-            raise RuntimeError("pdfplumber 또는 pypdf 설치 필요")
+        import pypdf, io
+        reader = pypdf.PdfReader(io.BytesIO(file_data))
+        return "\n".join(pg.extract_text() or "" for pg in reader.pages)
 
     if ext in ("xlsx", "xls"):
         try:
