@@ -793,3 +793,453 @@ def run_pipeline(job_id, jobs, project_name, vehicle_model,
     finally:
         if tmp_dir and tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── 프로젝트 비교 ────────────────────────────────────────────────────────────
+_DIFF_ORDER = {"b_missing": 0, "different": 1, "both_missing": 2, "same": 3,
+               "a_only": 4, "b_only": 5}
+
+def compare_fmea_projects(proj_a_id: str, proj_b_id: str) -> dict:
+    """두 프로젝트 FMEA 항목을 정규화 매칭으로 비교"""
+    FIELD_STR = "id,variable_name,failure_mode,severity,occurrence,detection,rpn,effect_system,preventive_action"
+
+    rows_a = sb_get("fmea_items", {"project_id": f"eq.{proj_a_id}", "select": FIELD_STR})
+    rows_b = sb_get("fmea_items", {"project_id": f"eq.{proj_b_id}", "select": FIELD_STR})
+
+    def build_lookup(rows):
+        lookup: dict[tuple, dict] = {}
+        for row in rows:
+            norm = normalize_varname(row["variable_name"])
+            key = (norm, row["failure_mode"])
+            if key not in lookup or (row.get("rpn") or 0) > (lookup[key].get("rpn") or 0):
+                lookup[key] = row
+        return lookup
+
+    lookup_a = build_lookup(rows_a)
+    lookup_b = build_lookup(rows_b)
+
+    result_rows = []
+    for key in sorted(set(lookup_a) | set(lookup_b), key=lambda k: (k[0] or "", k[1] or "")):
+        norm_vn, fm = key
+        ra = lookup_a.get(key)
+        rb = lookup_b.get(key)
+        a_sev = ra.get("severity") if ra else None
+        b_sev = rb.get("severity") if rb else None
+
+        if ra and rb:
+            if a_sev is not None and b_sev is None:
+                diff, rec = "b_missing", "copy_from_a"
+            elif a_sev is not None and b_sev is not None:
+                changed = (ra.get("severity") != rb.get("severity") or
+                           ra.get("occurrence") != rb.get("occurrence") or
+                           ra.get("detection") != rb.get("detection"))
+                diff, rec = ("different", "review") if changed else ("same", None)
+            else:
+                diff, rec = "both_missing", None
+        elif ra:
+            diff, rec = "a_only", None
+        else:
+            diff, rec = "b_only", (None if b_sev is not None else "rule_based")
+
+        result_rows.append({
+            "norm_key":        norm_vn,
+            "failure_mode":    fm,
+            "a_variable_name": ra["variable_name"] if ra else None,
+            "b_variable_name": rb["variable_name"] if rb else None,
+            "a_id":  ra["id"] if ra else None,
+            "b_id":  rb["id"] if rb else None,
+            "a_severity":   ra.get("severity")   if ra else None,
+            "a_occurrence": ra.get("occurrence") if ra else None,
+            "a_detection":  ra.get("detection")  if ra else None,
+            "a_rpn":        ra.get("rpn")        if ra else None,
+            "a_effect":     ra.get("effect_system") if ra else None,
+            "a_preventive": ra.get("preventive_action") if ra else None,
+            "b_severity":   rb.get("severity")   if rb else None,
+            "b_occurrence": rb.get("occurrence") if rb else None,
+            "b_detection":  rb.get("detection")  if rb else None,
+            "b_rpn":        rb.get("rpn")        if rb else None,
+            "diff":         diff,
+            "recommendation": rec,
+        })
+
+    result_rows.sort(key=lambda r: (_DIFF_ORDER.get(r["diff"], 9), r["norm_key"] or "", r["failure_mode"] or ""))
+
+    summary = {
+        "total_a":      len(rows_a),
+        "total_b":      len(rows_b),
+        "b_missing":    sum(1 for r in result_rows if r["diff"] == "b_missing"),
+        "different":    sum(1 for r in result_rows if r["diff"] == "different"),
+        "same":         sum(1 for r in result_rows if r["diff"] == "same"),
+        "a_only":       sum(1 for r in result_rows if r["diff"] == "a_only"),
+        "b_only":       sum(1 for r in result_rows if r["diff"] == "b_only"),
+        "both_missing": sum(1 for r in result_rows if r["diff"] == "both_missing"),
+    }
+    return {"summary": summary, "rows": result_rows}
+
+
+def apply_compare_patches(patches: list[dict]) -> int:
+    """비교에서 선택한 항목을 B 프로젝트에 적용 (A 값으로 덮어씀)"""
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        def apply_one(p):
+            patch = {f: p[f"a_{f}"] for f in
+                     ("severity", "occurrence", "detection", "effect_system", "preventive_action")
+                     if p.get(f"a_{f}") is not None}
+            if not patch:
+                return False
+            return sb_patch("fmea_items", {"id": f"eq.{p['b_id']}"}, patch)
+        futs = [ex.submit(apply_one, p) for p in patches]
+        for f in concurrent.futures.as_completed(futs):
+            if f.result():
+                done += 1
+    return done
+
+
+# ── 개념 FMEA (제어기능사양서 기반) ──────────────────────────────────────────
+# 개념 FMEA 실패모드 → DB failure_mode 매핑 (DB 제약: CORRUPT/EARLY/LATE/LESS/MORE)
+# LESS   = 기능 미수행 (출력이 전혀 없음)
+# CORRUPT = 기능 부정확 수행 (잘못된 결과)
+# MORE   = 비의도적 수행 (요청 없이 수행)
+# LATE   = 지연 수행
+CONCEPT_MODES = {
+    "LESS":    "{func}이(가) 요구 시점에 수행되지 않음 [기능 미수행]",
+    "CORRUPT": "{func}이(가) 부정확하게 수행됨 — 잘못된 결과 생성 [기능 부정확]",
+    "MORE":    "{func}이(가) 요청 없이 또는 잘못된 조건에서 수행됨 [비의도적 수행]",
+    "LATE":    "{func}이(가) 규정 시간보다 늦게 수행됨 [기능 지연]",
+}
+
+_CONCEPT_SEV = {
+    "Safety":        {"LESS": 9, "CORRUPT": 8, "MORE": 10, "LATE": 8},
+    "Control":       {"LESS": 7, "CORRUPT": 7, "MORE": 8,  "LATE": 6},
+    "Monitor":       {"LESS": 5, "CORRUPT": 5, "MORE": 4,  "LATE": 4},
+    "Communication": {"LESS": 6, "CORRUPT": 6, "MORE": 6,  "LATE": 7},
+    "Default":       {"LESS": 6, "CORRUPT": 6, "MORE": 7,  "LATE": 5},
+}
+_CONCEPT_OCC = {"LESS": 3, "CORRUPT": 4, "MORE": 2, "LATE": 3}
+_CONCEPT_DET = {"LESS": 4, "CORRUPT": 5, "MORE": 7, "LATE": 5}
+_CONCEPT_CAUSE = {
+    "LESS":    "SW 로직 오류, 입력 신호 누락, 전원/통신 장애",
+    "CORRUPT": "연산 로직 결함, 잘못된 파라미터, 센서 오류",
+    "MORE":    "상태 머신 오류, 조건 검사 누락, 경쟁 조건(race condition)",
+    "LATE":    "CPU 과부하, 통신 지연, 타이머 설정 오류",
+}
+_CONCEPT_PREVENTIVE = {
+    "LESS":    "기능 수행 여부 모니터링, 안전 상태 전환 로직 구현",
+    "CORRUPT": "출력 유효성 검사, E2E 보호 적용, 범위 체크",
+    "MORE":    "전제조건 검사 강화, 상태 머신 검증, 진입 조건 이중 확인",
+    "LATE":    "타임아웃 감시 구현, 태스크 주기 모니터링, alive counter",
+}
+_CONCEPT_EFFECT = {
+    "LESS":    "{func} 미수행으로 인한 시스템 기능 상실",
+    "CORRUPT": "{func} 오동작으로 인한 잘못된 제어 출력",
+    "MORE":    "{func} 비의도적 수행으로 인한 안전 위험",
+    "LATE":    "{func} 지연으로 인한 타임아웃 또는 기능 저하",
+}
+_CONCEPT_XREF = {
+    "LESS":    ["LESS", "MORE", "CORRUPT"],
+    "CORRUPT": ["CORRUPT", "MORE"],
+    "MORE":    ["MORE", "CORRUPT"],
+    "LATE":    ["LATE", "EARLY"],
+}
+
+
+def parse_spec_document(file_data: bytes, filename: str) -> str:
+    """제어기능사양서에서 텍스트 추출 (PDF / Excel / Word / TXT)"""
+    ext = filename.lower().rsplit(".", 1)[-1]
+
+    if ext == "pdf":
+        try:
+            import pdfplumber, io
+            with pdfplumber.open(io.BytesIO(file_data)) as pdf:
+                return "\n".join(p.extract_text() or "" for p in pdf.pages)
+        except ImportError:
+            pass
+        try:
+            import pypdf, io
+            reader = pypdf.PdfReader(io.BytesIO(file_data))
+            return "\n".join(pg.extract_text() or "" for pg in reader.pages)
+        except ImportError:
+            raise RuntimeError("pdfplumber 또는 pypdf 설치 필요")
+
+    if ext in ("xlsx", "xls"):
+        try:
+            import openpyxl, io
+            wb = openpyxl.load_workbook(io.BytesIO(file_data), read_only=True, data_only=True)
+            lines = []
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None and str(c).strip()]
+                    if cells:
+                        lines.append("\t".join(cells))
+            return "\n".join(lines)
+        except ImportError:
+            raise RuntimeError("openpyxl 설치 필요")
+
+    if ext == "docx":
+        try:
+            import docx as _docx, io
+            doc = _docx.Document(io.BytesIO(file_data))
+            lines = [p.text for p in doc.paragraphs if p.text.strip()]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        lines.append("\t".join(cells))
+            return "\n".join(lines)
+        except ImportError:
+            raise RuntimeError("python-docx 설치 필요")
+
+    if ext in ("txt", "csv"):
+        return file_data.decode("utf-8", errors="replace")
+
+    raise ValueError(f"지원하지 않는 파일 형식: {ext} (PDF/Excel/Word/TXT 지원)")
+
+
+def extract_functions_ai(text: str, project_name: str) -> list[dict]:
+    """Claude AI로 사양서에서 SW 기능 목록 추출 (크레딧 있을 때만)"""
+    if not AI_KEY:
+        return []
+    try:
+        import anthropic
+        # 타임아웃 15초, 재시도 없음
+        client = anthropic.Anthropic(api_key=AI_KEY, timeout=15.0, max_retries=0)
+        truncated = text[:8000] if len(text) > 8000 else text
+        prompt = (
+            f"다음은 '{project_name}' 제어기능사양서 내용입니다.\n\n{truncated}\n\n"
+            "이 문서에서 SW 기능(Function) 목록을 추출하세요.\n"
+            "각 기능에 대해 JSON 배열로 반환 (마크다운 없이):\n"
+            "- name: 기능명 (한국어, 간결하게 10자 이내)\n"
+            "- description: 기능 설명 (1-2문장)\n"
+            "- category: Safety / Control / Monitor / Communication 중 하나\n\n"
+            '[{"name":"기어변속 제어","description":"레버 포지션 기반 변속 명령 생성","category":"Control"},...]'
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        m = re.search(r'\[.*\]', resp.content[0].text.strip(), re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception as e:
+        print(f"AI 기능 추출 오류 (규칙 기반으로 폴백): {e}")
+    return []
+
+
+_BOILERPLATE = (
+    "본 문서", "SL CORPORATION", "현대자동차", "기아", "UTC+9", "비밀유지",
+    "무단 전재", "정보자산", "Page ", "Export of", "Produced by", "Exported from",
+)
+_SKIP_SECTIONS = ("I/O Table", "Data Flow", "상세 Description", "개요", "목적",
+                  "약어", "참조 문서", "시스템 개요", "외부 인터페이스", "내부 인터페이스")
+
+def extract_functions_heuristic(text: str) -> list[dict]:
+    """규칙 기반 기능 추출 — FRS 테이블 + 2단계 섹션 제목 우선"""
+    seen: set[str] = set()
+    funcs: list[dict] = []
+
+    def add(name: str, desc: str, cat: str):
+        name = name.strip().rstrip(":.").strip()
+        # 점 리더(TOC) 제거: "기어변속 제어 ......." → "기어변속 제어"
+        name = re.sub(r'\s*\.{2,}.*$', '', name).strip()
+        # 괄호 이전까지만 사용: "PRA 제어 PRA(Parking..." → "PRA 제어"
+        name = re.sub(r'\s+[A-Z가-힣]+\(.*$', '', name).strip()
+        # PDF 공백 아티팩트 제거: "ode 동작 모드" → "동작 모드"
+        name = re.sub(r'^[a-z]{1,5}\s+([가-힣])', r'\1', name)
+        # 숫자/영문 ID만 남는 항목 제외 (예: "ode-24", "FRS-42")
+        if re.match(r'^[A-Za-z\-]+[\d\-]+$', name):
+            return
+        # 문장형(조사 포함) 필터: 기능명이 아닌 문장 제외
+        if re.search(r'[의이가을를은는](?:\s|$)', name) and len(name) > 15:
+            return
+        if not name or len(name) < 3 or name in seen:
+            return
+        if any(b in name for b in _BOILERPLATE):
+            return
+        if any(s in name for s in _SKIP_SECTIONS):
+            return
+        seen.add(name)
+        funcs.append({"name": name[:40], "description": desc, "category": cat})
+
+    def guess_cat(n: str) -> str:
+        n = n.lower()
+        if any(k in n for k in ("안전", "잠금", "방지", "보호", "pra", "파킹")):
+            return "Safety"
+        if any(k in n for k in ("진단", "고장", "모니터", "감시", "검사", "dtc")):
+            return "Monitor"
+        if any(k in n for k in ("통신", "can", "송신", "수신", "ota", "네트워크")):
+            return "Communication"
+        return "Control"
+
+    # 1. FRS 테이블 패턴 (FRS-xxx  기능명  설명)
+    for m in re.finditer(r'(FRS-\w+)\s+([가-힣A-Za-z][^\n]{3,40})\s+([가-힣][^\n]{5,})', text):
+        name, desc = m.group(2).strip(), m.group(3).strip()[:80]
+        add(name, desc, guess_cat(name))
+
+    # 2. N.N 형태 2단계 섹션 (예: "2.1 동작 모드 제어") — 서브섹션(2.1.2) 제외
+    for m in re.finditer(r'(?:^|\n)\s*(\d+\.\d+)\s+([가-힣A-Za-z(][^\n]{3,50})', text):
+        name = m.group(2).strip()
+        add(name, f"{name} 기능 수행", guess_cat(name))
+
+    # 3. 최상위 번호 없는 항목 (예: "○ 기어변속 제어")
+    for m in re.finditer(r'(?:^|\n)\s*[○•·]\s+([가-힣][^\n]{4,30})', text):
+        name = m.group(1).strip()
+        add(name, f"{name} 기능 수행", guess_cat(name))
+
+    return funcs[:80]
+
+
+def run_concept_pipeline(job_id, jobs, project_name, vehicle_model,
+                         doc_data: bytes, doc_filename: str,
+                         extra_functions: list[dict]):
+    """제어기능사양서 → 개념 FMEA 자동 생성"""
+    job = jobs[job_id]
+
+    def log(msg: str, progress: int | None = None):
+        job["logs"].append(msg)
+        if progress is not None:
+            job["progress"] = progress
+        print(f"[{job_id[:8]}] {msg}")
+
+    try:
+        functions: list[dict] = list(extra_functions)
+
+        # ── 1. 문서 파싱 + 기능 추출 ────────────────────────────────────────
+        if doc_data:
+            log(f"문서 파싱: {doc_filename}...", 5)
+            try:
+                doc_text = parse_spec_document(doc_data, doc_filename)
+                log(f"  텍스트: {len(doc_text)}자 추출", 12)
+
+                ai_funcs = extract_functions_ai(doc_text, project_name)
+                if ai_funcs:
+                    log(f"  AI 추출: {len(ai_funcs)}개 기능", 20)
+                    functions.extend(ai_funcs)
+                else:
+                    h_funcs = extract_functions_heuristic(doc_text)
+                    log(f"  규칙 추출: {len(h_funcs)}개 기능", 20)
+                    functions.extend(h_funcs)
+            except Exception as e:
+                log(f"  문서 파싱 오류: {e} — 수동 입력만 사용")
+
+        if not functions:
+            raise ValueError("기능 목록이 비어 있습니다. 문서를 확인하거나 기능을 직접 입력해주세요.")
+
+        log(f"총 {len(functions)}개 기능 확인", 25)
+
+        # ── 2. 프로젝트 생성 ─────────────────────────────────────────────────
+        existing = sb_get("projects", {"name": f"eq.{project_name}", "select": "id"})
+        if existing:
+            project_id = existing[0]["id"]
+            requests.delete(f"{SB_URL}/rest/v1/fmea_items", headers=SB_H,
+                            params={"project_id": f"eq.{project_id}"}, verify=False)
+            log(f"  기존 프로젝트 초기화: {project_id[:8]}...")
+        else:
+            r = sb_post("projects", {"name": project_name, "vehicle_model": vehicle_model,
+                                      "description": f"개념 FMEA - {project_name}"})
+            project_id = (r[0] if isinstance(r, list) else r)["id"]
+            log(f"  새 프로젝트: {project_id[:8]}...", 30)
+
+        # SW Units — 카테고리별
+        unit_map: dict[str, str] = {}
+        for cat in {f.get("category", "Control") for f in functions}:
+            r = sb_post("sw_units", {"project_id": project_id, "name": cat})
+            unit_map[cat] = (r[0] if isinstance(r, list) else r)["id"]
+
+        # ── 3. FMEA 항목 생성 ────────────────────────────────────────────────
+        log("FMEA 항목 생성...", 35)
+        db_rows = []
+        item_no = 1
+        for func in functions:
+            fname = func.get("name", "")
+            cat   = func.get("category", "Control")
+            uid   = unit_map.get(cat)
+            sev_map = _CONCEPT_SEV.get(cat, _CONCEPT_SEV["Default"])
+            # DB category 제약: Internal / External 만 허용
+            db_cat = "External" if cat == "Communication" else "Internal"
+            for mode, tmpl in CONCEPT_MODES.items():
+                sev = sev_map[mode]
+                occ = _CONCEPT_OCC[mode]
+                det = _CONCEPT_DET[mode]
+                db_rows.append({
+                    "project_id":       project_id,
+                    "sw_unit_id":       uid,
+                    "item_no":          str(item_no),
+                    "category":         db_cat,
+                    "variable_name":    fname,
+                    "variable_type":    cat,   # 기능 카테고리 (Safety/Control/Monitor/Communication)
+                    "failure_mode":     mode,
+                    "failure_detail":   tmpl.format(func=fname),
+                    "potential_cause":  _CONCEPT_CAUSE[mode],
+                    "effect_module":    None,
+                    "severity":         sev,
+                    "occurrence":       occ,
+                    "detection":        det,
+                    "effect_system":    _CONCEPT_EFFECT[mode].format(func=fname),
+                    "preventive_action": _CONCEPT_PREVENTIVE[mode],
+                    "status":           "draft",
+                    "ai_generated":     False,
+                })
+                item_no += 1
+
+        log(f"  {len(db_rows)}개 항목 삽입 중...", 50)
+        inserted = 0
+        for i in range(0, len(db_rows), 200):
+            chunk = db_rows[i:i+200]
+            r = requests.post(f"{SB_URL}/rest/v1/fmea_items", headers=SB_H,
+                              json=chunk, verify=False)
+            if r.status_code in (200, 201):
+                inserted += len(chunk)
+            log(f"  삽입: {min(i+200, len(db_rows))}/{len(db_rows)}")
+
+        # ── 4. 기존 FMEA 교차참조로 S/O/D 보강 ─────────────────────────────
+        log("기존 FMEA 교차참조 보강...", 70)
+        all_src: list[dict] = []
+        for pid in SRC_PROJECT_IDS:
+            rows = sb_get("fmea_items", {
+                "project_id": f"eq.{pid}", "severity": "not.is.null",
+                "select": "variable_name,failure_mode,severity,occurrence,detection,rpn,effect_system,preventive_action",
+            })
+            all_src.extend(rows)
+        norm_lookup = build_sod_lookup(all_src)
+
+        concept_items = sb_get("fmea_items", {
+            "project_id": f"eq.{project_id}",
+            "select": "id,variable_name,failure_mode",
+        })
+        patch_batch = []
+        for item in concept_items:
+            norm = normalize_varname(item["variable_name"])
+            for dm in _CONCEPT_XREF.get(item["failure_mode"], ["CORRUPT"]):
+                if norm in norm_lookup and dm in norm_lookup[norm]:
+                    src = norm_lookup[norm][dm]
+                    if (src.get("rpn") or 0) > 0:
+                        patch_batch.append((item["id"], {
+                            "severity":          src["severity"],
+                            "occurrence":        src["occurrence"],
+                            "detection":         src["detection"],
+                            "effect_system":     src.get("effect_system"),
+                            "preventive_action": src.get("preventive_action"),
+                        }))
+                    break
+
+        xref_done = 0
+        if patch_batch:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+                futs = {ex.submit(sb_patch, "fmea_items", {"id": f"eq.{iid}"}, patch): iid
+                        for iid, patch in patch_batch}
+                for f in concurrent.futures.as_completed(futs):
+                    if f.result():
+                        xref_done += 1
+        log(f"  교차참조 보강: {xref_done}/{len(concept_items)}개", 90)
+
+        log(f"완료! {len(functions)}개 기능 x 4모드 = {inserted}개 항목 생성", 99)
+        job["project_id"] = project_id
+        job["status"]     = "done"
+        job["progress"]   = 100
+
+    except Exception as e:
+        import traceback
+        job["status"] = "error"
+        job["error"]  = str(e)
+        log(f"오류: {e}")
+        traceback.print_exc()

@@ -1,11 +1,12 @@
 """FMEA Pipeline API — Railway 배포용 FastAPI 앱"""
 
-import uuid, os, requests as _req
+import uuid, os, json, requests as _req
+from typing import Any
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pipeline import run_pipeline
+from pipeline import run_pipeline, compare_fmea_projects, apply_compare_patches, run_concept_pipeline
 
 SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
 SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
@@ -111,3 +112,50 @@ def find_similar(req: SimilarRequest):
             results = r3.json()
 
     return {"results": results}
+
+
+@app.post("/jobs/concept")
+async def create_concept_job(
+    background_tasks: BackgroundTasks,
+    project_name: str = Form(...),
+    vehicle_model: str = Form(...),
+    spec_file: UploadFile = File(default=None),
+    functions_json: str = Form(default="[]"),
+):
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "progress": 0, "logs": [], "project_id": None}
+
+    doc_data, doc_filename = b"", ""
+    if spec_file and spec_file.filename:
+        doc_data = await spec_file.read()
+        doc_filename = spec_file.filename
+
+    extra_functions = json.loads(functions_json)
+
+    background_tasks.add_task(
+        run_concept_pipeline, job_id, jobs,
+        project_name, vehicle_model, doc_data, doc_filename, extra_functions
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/projects")
+def list_projects():
+    r = _req.get(f"{SB_URL}/rest/v1/projects", headers=SB_H,
+                 params={"select": "id,name,vehicle_model,created_at",
+                         "order": "created_at.desc"}, verify=False)
+    return r.json()
+
+
+@app.get("/compare/{proj_a_id}/{proj_b_id}")
+def compare_projects(proj_a_id: str, proj_b_id: str):
+    return compare_fmea_projects(proj_a_id, proj_b_id)
+
+
+class ApplyRequest(BaseModel):
+    patches: list[dict[str, Any]]
+
+@app.post("/compare/apply")
+def apply_comparison(req: ApplyRequest):
+    done = apply_compare_patches(req.patches)
+    return {"applied": done}
