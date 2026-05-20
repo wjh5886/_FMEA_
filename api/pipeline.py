@@ -895,6 +895,108 @@ def apply_compare_patches(patches: list[dict]) -> int:
     return done
 
 
+# ── 가이드라인 기반 S/O/D 업데이트 ────────────────────────────────────────────
+# SL_Software FMEA Guideline v4.2 규칙 요약:
+#   Severity : Safety Goal 위배/주기능상실(9~7) > 2차기능저하(6~5) > 품질저하(4~2)
+#   Occurrence: 베이스 차종(JG1) 실적 반영 — 검증된 신호는 낮게, 신규는 높게
+#   Detection : 베이스 차종 테스트 계승 시 PV 수준(3~5), 신규 신호 DV 수준(5~7)
+
+# failure_mode 별 신규 신호 기본 D 오프셋
+_FM_DET_NEW = {"LESS": 5, "CORRUPT": 5, "MORE": 6, "EARLY": 6, "LATE": 6}
+# failure_mode 별 신규 신호 기본 O (신규 설계 기준)
+_FM_OCC_NEW = {"LESS": 4, "CORRUPT": 4, "MORE": 3, "EARLY": 3, "LATE": 3}
+
+
+def _guideline_sod(base_sev, base_occ, base_det, fm, is_new: bool):
+    """가이드라인 규칙으로 보정된 (S, O, D) 반환"""
+    if is_new:
+        # 신규 신호: 현재 값과 신규 기준값 중 보수적 선택
+        sev = base_sev  # severity는 신호 특성으로 결정, 현재 유지
+        occ = max(base_occ, _FM_OCC_NEW.get(fm, 4))   # 신규는 최소 4
+        det = max(base_det, _FM_DET_NEW.get(fm, 5))   # 신규는 최소 5 (DV 수준)
+    else:
+        # 베이스 차종 계승 신호: OCC는 JG1 실적 반영하여 현재보다 낮게 가능
+        sev = base_sev
+        occ = min(base_occ, 3)   # 검증된 베이스 → OCC 최대 3
+        det = min(base_det, 5)   # 테스트 계승 → DET 최대 5
+    return sev, occ, det
+
+
+def update_project_by_guideline(proj_id: str, base_proj_id: str) -> dict:
+    """
+    가이드라인(SL_Software FMEA Guideline v4.2) 기반으로 proj_id 항목 S/O/D 업데이트.
+    base_proj_id(JG1 등 베이스 차종)와 비교해 매칭/신규 여부를 구분.
+    """
+    cmp = compare_fmea_projects(base_proj_id, proj_id)
+    rows = cmp["rows"]
+
+    # (norm_key, failure_mode) → 비교 행
+    lookup: dict[tuple, dict] = {(r["norm_key"], r["failure_mode"]): r for r in rows}
+
+    items = sb_get("fmea_items", {
+        "project_id": f"eq.{proj_id}",
+        "select": "id,variable_name,failure_mode,severity,occurrence,detection,category",
+    })
+
+    patches = []
+    stats = {"matched_updated": 0, "new_updated": 0, "skipped": 0}
+
+    for item in items:
+        norm = normalize_varname(item["variable_name"])
+        fm   = item["failure_mode"] or ""
+        key  = (norm, fm)
+        row  = lookup.get(key)
+
+        cur_s = item.get("severity") or 0
+        cur_o = item.get("occurrence") or 0
+        cur_d = item.get("detection") or 0
+
+        if row and row["a_severity"] is not None:
+            # 베이스 차종에 동일 신호 존재 → 매칭 신호
+            a_s = row["a_severity"]
+            a_o = row["a_occurrence"]
+            a_d = row["a_detection"]
+
+            # Severity: JG1보다 2 이상 낮으면 JG1-1로 상향 (Safety 일관성)
+            new_s = cur_s if cur_s >= a_s - 1 else a_s - 1
+
+            # Occurrence: 베이스 실적 반영 — JG1 OCC 이하이면서 최소 2
+            new_o = max(2, min(cur_o, a_o))
+
+            # Detection: 테스트 계승 → 최대 5 (PV 수준)
+            new_d = min(cur_d, max(3, a_d))
+
+            if (new_s, new_o, new_d) != (cur_s, cur_o, cur_d):
+                patches.append({"id": item["id"], "severity": new_s,
+                                 "occurrence": new_o, "detection": new_d})
+                stats["matched_updated"] += 1
+            else:
+                stats["skipped"] += 1
+        else:
+            # 신규 신호 (베이스 없음)
+            new_s, new_o, new_d = _guideline_sod(cur_s, cur_o, cur_d, fm, is_new=True)
+            if (new_s, new_o, new_d) != (cur_s, cur_o, cur_d):
+                patches.append({"id": item["id"], "severity": new_s,
+                                 "occurrence": new_o, "detection": new_d})
+                stats["new_updated"] += 1
+            else:
+                stats["skipped"] += 1
+
+    # 배치 업데이트
+    updated = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        def do_patch(p):
+            pid = p.pop("id")
+            return sb_patch("fmea_items", {"id": f"eq.{pid}"}, p)
+        futs = [ex.submit(do_patch, p) for p in patches]
+        for f in concurrent.futures.as_completed(futs):
+            if f.result():
+                updated += 1
+
+    stats["total_patched"] = updated
+    return stats
+
+
 # ── 개념 FMEA (제어기능사양서 기반) ──────────────────────────────────────────
 # 개념 FMEA 실패모드 → DB failure_mode 매핑 (DB 제약: CORRUPT/EARLY/LATE/LESS/MORE)
 # LESS   = 기능 미수행 (출력이 전혀 없음)

@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pipeline import run_pipeline, compare_fmea_projects, apply_compare_patches, run_concept_pipeline
+from pipeline import run_pipeline, compare_fmea_projects, apply_compare_patches, run_concept_pipeline, update_project_by_guideline
 
 SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
 SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
@@ -159,3 +159,10 @@ class ApplyRequest(BaseModel):
 def apply_comparison(req: ApplyRequest):
     done = apply_compare_patches(req.patches)
     return {"applied": done}
+
+
+@app.post("/projects/{proj_id}/guideline-update")
+def guideline_update(proj_id: str, base_proj_id: str):
+    """가이드라인(SL SW FMEA Guideline v4.2) 기반으로 S/O/D 업데이트"""
+    stats = update_project_by_guideline(proj_id, base_proj_id)
+    return stats
