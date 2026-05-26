@@ -215,3 +215,39 @@ for i in range(0, len(updates), 100):
     print(f"  진행: {min(i+100, len(updates))}/{len(updates)}")
 
 print(f"\n✓ {ok}개 signal_range 업데이트 완료")
+
+# ── 7. 0~0 잘못된 범위 정리 ─────────────────────────────────────
+# NM 메시지 등 DBC에서 [0|0]으로 정의된 신호는 물리 범위 없음 → NULL로 정리
+print("\n0~0 잘못된 범위 정리 중...")
+import re as _re
+# 로컬에서 0~0 항목 식별 (모든 서브범위가 0 ~ 0 인 경우)
+zero_pat = _re.compile(r'^[\w\s]+:\s*0\s*~\s*0')
+all_range_items = []
+offset2 = 0
+while True:
+    r = requests.get(
+        f"{URL}/rest/v1/fmea_items?project_id=eq.{PROJ_ID}"
+        f"&signal_range=not.is.null&select=id,signal_range&offset={offset2}&limit=1000",
+        headers=H, verify=False,
+    )
+    batch = r.json()
+    if not batch: break
+    all_range_items.extend(batch)
+    offset2 += len(batch)
+    if len(batch) < 1000: break
+
+cleared = 0
+for item in all_range_items:
+    rng = item.get("signal_range") or ""
+    # 세미콜론 또는 파이프로 분리된 모든 서브범위가 "xxx: 0 ~ 0" 인 경우
+    parts = [p.strip() for p in _re.split(r'[;|]', rng) if p.strip()]
+    if parts and all(_re.search(r':\s*0\s*~\s*0\s*$', p) for p in parts):
+        r2 = requests.patch(
+            f"{URL}/rest/v1/fmea_items?id=eq.{item['id']}",
+            json={"signal_range": None},
+            headers=H, verify=False,
+        )
+        if r2.status_code < 300:
+            cleared += 1
+
+print(f"✓ {cleared}개 0~0 잘못된 범위 NULL로 정리 완료")
