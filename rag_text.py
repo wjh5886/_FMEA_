@@ -17,9 +17,9 @@ import re
 
 # ARXML De/Dg 계열 접두어 (pipeline.normalize_varname과 동일한 세트)
 _DE_PREFIXES = {"de", "dg", "di", "dv", "dp", "dm"}
-# 의미 없는 토큰 (컴포넌트 접두어, 포트 방향, 타입 표기, 일반어)
+# 의미 없는 토큰 (컴포넌트 접두어, 포트 방향, 타입 표기, 일반어, RTE 접근자)
 _NOISE_TOKENS = {"i", "p", "b", "o", "ct", "ap", "ctap", "ctdcm", "raw",
-                 "sig", "msg", "message"}
+                 "sig", "msg", "message", "get"}
 
 # 자동차 SW 신호명 약어 → 전체 단어 (관찰된 어휘만, 애매한 것은 제외)
 # 같은 신호가 프로젝트마다 다른 약어로 표기되는 문제를 흡수:
@@ -57,6 +57,9 @@ def build_embed_text(variable_name: str, failure_mode: str | None) -> str:
     """
     base = variable_name.split("(")[0].strip()
 
+    # 배열 첨자 제거: SActSigTo[0] → SActSigTo
+    base = re.sub(r"\[\w*\]", "", base)
+
     # 타입 접두어는 분리 전에 제거 (u1 → "u 1"로 쪼개지는 것 방지)
     base = re.sub(r"(?:^|_)u\d+_", "_", base).strip("_")
 
@@ -73,6 +76,11 @@ def build_embed_text(variable_name: str, failure_mode: str | None) -> str:
 
     # De/Dg 접두어가 첫 단어에 붙어있는 경우 (DeIdtSta → De Idt Sta)
     if len(kept) >= 2 and kept[0].lower() in _DE_PREFIXES:
+        kept = kept[1:]
+
+    # Rx/Tx 포트 방향 접두어는 첫 토큰일 때만 제거 (RxMainCAN_... → MainCAN...)
+    # MainCanRxSta처럼 중간에 오는 Rx/Tx는 수신/송신 의미가 있어 보존
+    if len(kept) >= 2 and kept[0].lower() in {"rx", "tx"}:
         kept = kept[1:]
 
     # 낱글자 토큰은 다음 단어에 병합 (SActSig → S Act Sig → SAct Sig)
