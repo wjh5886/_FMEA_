@@ -26,6 +26,8 @@ httpx.AsyncClient.__init__ = _ssl_async
 
 from sentence_transformers import SentenceTransformer
 
+from rag_text import build_embed_text
+
 SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
 SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
 SB_H = {
@@ -54,12 +56,8 @@ BATCH_SIZE = 256
 UPSERT_BATCH = 100
 
 
-def embed_text(vn: str, fm: str | None) -> str:
-    """임베딩할 텍스트 구성: 신호명 + 고장 모드"""
-    # 변수명에서 괄호 안 범위 설명 제거해 핵심 이름만
-    base = vn.split("(")[0].strip()
-    mode = fm or "ANY"
-    return f"{base} {mode}"
+# 임베딩 텍스트 구성은 rag_text.build_embed_text로 통일 (검색 쿼리와 동일해야 함)
+embed_text = build_embed_text
 
 
 def sb_get_items(pid: str) -> list:

@@ -30,6 +30,8 @@ httpx.AsyncClient.__init__ = _ssl_async
 
 from sentence_transformers import SentenceTransformer
 
+from rag_text import build_embed_text
+
 SB_URL = "https://itzgdbeiyvodhfhmvrfw.supabase.co"
 SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emdkYmVpeXZvZGhmaG12cmZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDE2MzcsImV4cCI6MjA5MjMxNzYzN30.iqzQr-3Lqf1O4UHFe9euTLyeIyBXreLPoSzUdtEaNP8"
 SB_H = {
@@ -59,9 +61,7 @@ class RagSearcher:
         return self._model
 
     def embed(self, variable_name: str, failure_mode: str | None) -> list[float]:
-        base = variable_name.split("(")[0].strip()
-        mode = failure_mode or "ANY"
-        text = f"{base} {mode}"
+        text = build_embed_text(variable_name, failure_mode)
         vec = self.model.encode(text, normalize_embeddings=True)
         return vec.tolist()
 

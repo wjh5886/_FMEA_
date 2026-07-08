@@ -25,6 +25,26 @@ SW FMEA 자동화를 위한 Python 스크립트 모음.
 | `cross_ref.py` | 신호 교차 참조 |
 | `update_dbc_values.py` | DBC 파일 값 업데이트 |
 
+## RAG 유사 사례 검색
+
+| 파일 | 설명 |
+|---|---|
+| `rag_text.py` | 임베딩 텍스트 정규화 공용 모듈 (약어 확장, camelCase 분리, canonical 앵커) |
+| `rag_embed.py` | FMEA 항목 임베딩 생성 → Supabase 저장 |
+| `rag_search.py` | 유사 FMEA 항목 검색 (CLI / `RagSearcher` 모듈) |
+
+```bash
+# 임베딩 재생성 (rag_text.py 변경 시 필수, 회사망에서는 오프라인 모드로)
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -u rag_embed.py            # 전체
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -u rag_embed.py JG1 LQ2    # 특정 프로젝트
+
+# 유사 항목 검색
+python rag_search.py "BDC_02_Timeout" "LATE" --top 3
+```
+
+> `rag_embed.py`와 `rag_search.py`는 반드시 같은 `rag_text.build_embed_text()`를
+> 사용해야 함 (코퍼스와 쿼리의 임베딩 텍스트 형식이 다르면 검색 품질 급락).
+
 ## 환경 설정
 
 ```bash
